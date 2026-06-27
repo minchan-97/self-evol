@@ -512,6 +512,102 @@ class GrowingSOM:
 #   - 저밀도(덜 탐색된) 노드 근처의 대표 단어를 뽑아 검색어로 만든다
 #   - 이렇게 만든 검색어로 크롤링하면 "안 배운 영역"을 채우게 된다
 # ======================================================================
+def learning_reward(qe_before, qe_after, vocab_before, vocab_after,
+                    zpd_low=0.15, zpd_high=0.5,
+                    w_assimilate=1.0, w_difficulty=0.6, w_diversity=0.4):
+    """
+    한 번의 학습(자료 투입+학습)이 '좋은 학습'이었는지 보상으로 평가.
+
+    교육학적 직관:
+      - assimilate: 결국 지도에 녹아들었는가 (QE가 내려갔는가) → 학습 성공
+      - difficulty: 너무 쉽지도(QE 변화 거의 0) 너무 어렵지도(QE 폭증) 않은
+                    '적당한 난이도'(ZPD, 근접발달영역)에 가산점
+      - diversity : 어휘 다양성이 유지/증가하면 +, 단조 폭락이면 - (단, 모험 허용)
+
+    반환: (총보상, 세부dict)
+    """
+    # 1) 동화(assimilation): QE가 내려갈수록 +. 상대 변화율 사용
+    rel_qe = (qe_before - qe_after) / (abs(qe_before) + 1e-8)
+    r_assim = w_assimilate * rel_qe          # QE 내려가면 +, 오르면 -
+
+    # 2) 난이도(ZPD): '도전했고 결국 녹여낸' 경우만 보너스.
+    #    QE가 올라가버린(동화 실패) 경우엔 난이도 보너스를 주지 않는다.
+    challenge = abs(qe_after - qe_before) / (abs(qe_before) + 1e-8)
+    assimilated = qe_after <= qe_before          # 결국 녹아들었는가
+    if not assimilated:
+        # 동화 실패(QE 상승) = 너무 어렵거나 잡음 → 난이도 보너스 없음, 감점
+        over = min(2.0, challenge / zpd_high)
+        r_diff = -w_difficulty * over * 0.5
+    elif zpd_low <= challenge <= zpd_high:
+        r_diff = w_difficulty * 1.0              # 적당히 도전 + 녹여냄 = 최고
+    elif challenge < zpd_low:
+        r_diff = w_difficulty * (challenge / zpd_low) * 0.5   # 너무 쉬움
+    else:
+        over = min(2.0, (challenge - zpd_high) / zpd_high)
+        r_diff = w_difficulty * (1.0 - over)     # 녹였지만 좀 과함
+
+    # 3) 다양성: 떨어져도 '모험'으로 어느 정도 허용 → 하락에 둔감, 상승에 민감
+    d_vocab = vocab_after - vocab_before
+    if d_vocab >= 0:
+        r_div = w_diversity * d_vocab * 2.0           # 상승은 두 배로 보상
+    else:
+        # 하락은 모험으로 절반만 벌점 + 작은 하락은 무시(탐색 허용)
+        tolerated = max(0.0, -d_vocab - 0.05)         # 0.05까지는 봐줌
+        r_div = -w_diversity * tolerated * 0.5
+
+    total = r_assim + r_diff + r_div
+    return total, {
+        "assimilate": round(r_assim, 3),
+        "difficulty": round(r_diff, 3),
+        "diversity": round(r_div, 3),
+        "challenge": round(challenge, 3),
+        "total": round(total, 3),
+    }
+
+
+class QueryPolicy:
+    """
+    보상 기반 자율 검색어 정책.
+    - 각 검색어(또는 그 키워드)의 누적 보상을 기억
+    - 다음 자율 탐색에서 보상 높았던 방향의 키워드에 가중치 부여
+    - epsilon-greedy: 가끔은 새 방향도 탐색(exploration)
+    교육학: '잘 배워지는 주제는 더 깊이, 가끔은 새 주제도 모험'
+    """
+    def __init__(self, epsilon=0.3):
+        self.kw_reward = {}     # 키워드 -> 누적보상
+        self.kw_count = {}      # 키워드 -> 시도횟수
+        self.epsilon = epsilon
+        self.log = []           # (검색어, 보상) 이력
+
+    def record(self, query, reward):
+        self.log.append((query, round(reward, 3)))
+        for w in query.split():
+            self.kw_reward[w] = self.kw_reward.get(w, 0.0) + reward
+            self.kw_count[w] = self.kw_count.get(w, 0) + 1
+
+    def score_keyword(self, w):
+        """키워드의 평균 보상(미시도는 0=중립)."""
+        if w not in self.kw_count:
+            return 0.0
+        return self.kw_reward[w] / self.kw_count[w]
+
+    def rank_queries(self, candidate_queries, rng=None):
+        """
+        후보 검색어들을 보상 기대치로 정렬.
+        epsilon 확률로는 무작위(탐색), 아니면 보상순(활용).
+        """
+        import random as _r
+        rng = rng or _r.Random()
+        if rng.random() < self.epsilon:
+            shuffled = list(candidate_queries)
+            rng.shuffle(shuffled)
+            return shuffled, "explore"
+        scored = sorted(candidate_queries,
+                        key=lambda q: -np.mean([self.score_keyword(w)
+                                                for w in q.split()] or [0]))
+        return scored, "exploit"
+
+
 def autonomous_queries(gsom, X, corpus, emb, n_queries=3, words_per_query=2):
     """
     반환: [검색어, ...]
@@ -1184,6 +1280,7 @@ class SelfLoopState:
         self.guardrail = MarkovGuardrail() # 도메인 마르코프 가드레일
         self.guard_threshold = -9.5        # 거부 임계값
         self.rejected_log: list = []       # 거부된 문장 기록(검토용)
+        self.policy = QueryPolicy(epsilon=0.3)  # 보상 기반 검색어 정책
         self.created = time.time()
 
     def fit_guardrail(self, percentile=15):
@@ -1221,6 +1318,9 @@ class SelfLoopState:
             "corpus": self.corpus,
             "history": self.history,
             "created": self.created,
+            "policy_reward": self.policy.kw_reward,
+            "policy_count": self.policy.kw_count,
+            "policy_log": self.policy.log[-300:],
         }
         with open(path, "wb") as f:
             pickle.dump(blob, f)
@@ -1238,6 +1338,10 @@ class SelfLoopState:
         st.corpus = b["corpus"]
         st.history = b["history"]
         st.created = b.get("created", time.time())
+        # 정책 복원(옛 pkl엔 없을 수 있음)
+        st.policy.kw_reward = b.get("policy_reward", {})
+        st.policy.kw_count = b.get("policy_count", {})
+        st.policy.log = b.get("policy_log", [])
         # 코퍼스로 가드레일 재구성 (옛 pkl도 호환)
         if len(st.corpus) >= 10:
             try:
