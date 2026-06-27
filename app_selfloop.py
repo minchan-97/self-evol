@@ -387,6 +387,25 @@ with page[0]:
             if guard_msg:
                 st.markdown(f'<div class="ok">{guard_msg}</div>', unsafe_allow_html=True)
             X = emb.encode_many(stt.corpus)
+            # --- 차원 불일치 방어 ---
+            emb_dim = X.shape[1]
+            som_dim = stt.gsom.W.shape[1] if stt.gsom.W.size else emb_dim
+            if emb_dim != som_dim:
+                st.markdown(
+                    f'<div class="warn">차원 불일치: 임베딩 dim({emb_dim}) ≠ '
+                    f'SOM dim({som_dim}). 현재 임베딩에 맞춰 SOM을 새로 시작합니다. '
+                    f'(이전 SOM 학습은 초기화되지만 코퍼스는 유지됩니다)</div>',
+                    unsafe_allow_html=True)
+                from selfloop_engine import GrowingSOM
+                import numpy as _np
+                stt.dim = emb_dim
+                stt.gsom = GrowingSOM(dim=emb_dim, init_nodes=36, seed=0)
+                _rng = _np.random.default_rng(0)
+                _idx = _rng.choice(len(X), min(36, len(X)), replace=False)
+                stt.gsom.W = X[_idx].copy() + _rng.normal(scale=0.01, size=(len(_idx), emb_dim))
+                stt.gsom.coords = stt.gsom.coords[:len(_idx)]
+                stt.gsom.err = stt.gsom.err[:len(_idx)]
+                stt.history = []
             toks = [s.split() for s in stt.corpus]
             time_limit = {"1분":60,"5분":300,"10분":600}.get(mode_r)
             t_start = time.time()
@@ -472,6 +491,14 @@ with page[1]:
 
         if st.button("▶ 답변 생성", type="primary") and q.strip():
             qv = emb.encode(q)
+            # 차원 불일치 방어: 임베딩과 SOM dim이 다르면 안내 후 중단
+            if stt.gsom.W.size and qv.shape[0] != stt.gsom.W.shape[1]:
+                st.markdown(
+                    f'<div class="warn">차원 불일치: 임베딩 dim({qv.shape[0]}) ≠ '
+                    f'SOM dim({stt.gsom.W.shape[1]}).<br>학습 루프에서 현재 임베딩으로 '
+                    f'다시 학습한 뒤 질문하세요(또는 저장 당시 임베딩을 올리세요).</div>',
+                    unsafe_allow_html=True)
+                st.stop()
             # SOM 가드레일: 질문이 학습 분포 안인가 (BMU 거리)
             qbmu, qdist = stt.gsom.bmu(qv)
             # 코퍼스에서 질문 BMU에 가까운 문장들 = 맥락
