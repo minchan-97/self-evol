@@ -1349,4 +1349,3 @@ class SelfLoopState:
             except Exception:
                 pass
         return st
-
