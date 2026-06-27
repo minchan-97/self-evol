@@ -211,31 +211,79 @@ with page[0]:
                 else:
                     st.markdown('<div class="warn">검색어를 생성하지 못했습니다 '
                                 '(코퍼스가 더 필요).</div>', unsafe_allow_html=True)
-            if st.button("🤖 자율 수집 실행"):
-                from selfloop_engine import autonomous_queries, crawl_topic
+            auto_rounds = st.slider("검색어당 학습 라운드", 1, 10, 3, key="auto_rounds")
+            if st.button("🤖 자율 수집 + 학습 (보상 루프)"):
+                from selfloop_engine import (autonomous_queries, crawl_topic,
+                                             measure, learning_reward)
+                import numpy as _np
+                # 1) 후보 검색어 생성 → 정책으로 정렬(explore/exploit)
                 Xa = emb.encode_many(stt.corpus)
-                qs = autonomous_queries(stt.gsom, Xa, stt.corpus, emb, n_queries=auto_nq)
-                if not qs:
+                cands = autonomous_queries(stt.gsom, Xa, stt.corpus, emb,
+                                           n_queries=auto_nq * 2)
+                if not cands:
                     st.markdown('<div class="warn">검색어 생성 실패.</div>',
                                 unsafe_allow_html=True)
                 else:
-                    collected = []
-                    for q in qs:
-                        with st.spinner(f"자율 검색: '{q}' ..."):
+                    import random as _r
+                    ranked, mode = stt.policy.rank_queries(cands, rng=_r.Random())
+                    queries = ranked[:auto_nq]
+                    st.caption(f"정책 모드: {mode} · 검색어: {', '.join(queries)}")
+                    # 가드레일 준비
+                    if len(stt.corpus) >= 10:
+                        stt.fit_guardrail(percentile=25)
+                    results = []
+                    for q in queries:
+                        with st.spinner(f"'{q}' 수집·학습 중..."):
                             try:
-                                s, src_log, links = crawl_topic(
+                                s, _log, _lk = crawl_topic(
                                     q, max_pages=auto_pages, return_sources=True,
                                     brave_api_key=auto_brave.strip() or None)
-                                collected += s
-                                st.caption(f"'{q}' → {len(s)}문장")
                             except Exception as e:
-                                st.caption(f"'{q}' 실패: {e}")
-                    new_sentences = collected
-                    st.session_state._crawled = collected
-                    if collected:
-                        st.success(f"자율 수집 {len(collected)}문장 "
-                                   f"(아래 '학습 시작'으로 가드레일 거쳐 학습)")
-        new_sentences = st.session_state.get("_crawled", []) if src.startswith("🤖") else new_sentences
+                                st.caption(f"'{q}' 수집 실패: {e}"); continue
+                            if not s:
+                                st.caption(f"'{q}' → 0문장"); 
+                                stt.policy.record(q, -0.1)  # 수집 실패도 약한 벌점
+                                continue
+                            # 가드레일 통과분만
+                            added, rej = stt.add_sentences(s, use_guardrail=True)
+                            if added == 0:
+                                st.caption(f"'{q}' → 전부 도메인 밖 거부")
+                                stt.policy.record(q, -0.2)
+                                continue
+                            # 학습 전 지표
+                            X = emb.encode_many(stt.corpus)
+                            toks = [x.split() for x in stt.corpus]
+                            m0 = measure(stt.gsom, X, toks)
+                            # 학습
+                            for _ in range(auto_rounds):
+                                stt.gsom.round += 1
+                                lr = max(0.02, 0.4 * (0.9 ** stt.gsom.round))
+                                rad = max(0.5, 2.0 * (0.85 ** stt.gsom.round))
+                                stt.gsom.train_step(X, lr, rad)
+                                stt.gsom.grow()
+                            m1 = measure(stt.gsom, X, toks)
+                            m1["round"] = stt.gsom.round; m1["grew"] = 0
+                            stt.history.append(m1)
+                            # 보상 계산 + 정책 기록
+                            reward, detail = learning_reward(
+                                m0["mean_qe"], m1["mean_qe"],
+                                m0["vocab_div"], m1["vocab_div"])
+                            stt.policy.record(q, reward)
+                            results.append((q, added, rej, reward, detail))
+                    # 결과 표시
+                    if results:
+                        st.success(f"자율 학습 완료 · {len(results)}개 검색어")
+                        for q, added, rej, reward, d in results:
+                            tag = "✓" if reward > 0.25 else ("△" if reward > 0 else "✗")
+                            st.markdown(
+                                f"<div class='{'ok' if reward>0 else 'warn'}'>"
+                                f"{tag} <b>{q}</b> · 보상 {reward:+.2f} "
+                                f"(통과 {added}/거부 {rej}) · "
+                                f"동화{d['assimilate']:+} 난이도{d['difficulty']:+} "
+                                f"다양성{d['diversity']:+}</div>",
+                                unsafe_allow_html=True)
+                        st.caption("보상이 높았던 검색어 방향이 다음 자율 탐색에서 우선됩니다.")
+        new_sentences = []  # 자율 모드는 위에서 학습까지 끝냄
 
     elif src == "코퍼스 직접 입력/업로드":
         c1, c2 = st.columns(2)
