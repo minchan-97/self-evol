@@ -385,26 +385,34 @@ class MarkovGuardrail:
 
     def suggest_threshold(self, sentences, percentile=10, holdout=0.2):
         """
-        임계값 추천. 학습 문장은 바이그램이 외워져 점수가 비정상적으로 높으므로,
-        일부를 holdout으로 떼어 '학습 안 한 도메인 문장'의 점수 분포로 경계를 잡는다.
+        임계값 추천. holdout(안 외운 도메인 문장)의 점수 분포에서 경계를 잡되,
+        큰 코퍼스에서 과하게 빡빡해지지 않도록 마진과 절대 하한을 둔다.
         """
         import random as _rnd
         if len(sentences) < 10:
-            # 데이터 적으면 그냥 전체 분포 하위 percentile
             scores = sorted(self.score(s) for s in sentences)
             k = max(0, int(len(scores) * percentile / 100) - 1)
-            return scores[k] if scores else -9.0
+            return min(scores[k] if scores else -9.0, -6.0)
         sents = list(sentences)
         _rnd.Random(0).shuffle(sents)
-        n_hold = max(5, int(len(sents) * holdout))
+        n_hold = max(10, int(len(sents) * holdout))
         hold = sents[:n_hold]
         train = sents[n_hold:]
-        # holdout을 빼고 다시 학습 → holdout은 '안 외운 도메인 문장'
         probe = MarkovGuardrail(self.jm).fit(train)
         scores = sorted(probe.score(s) for s in hold)
-        # holdout 점수의 하위 percentile을 경계로 (도메인 안 문장 대부분을 통과시키되 최하위는 컷)
+        if not scores:
+            return -9.0
+        # 하위 percentile 위치
         k = max(0, int(len(scores) * percentile / 100) - 1)
-        return scores[k] if scores else -9.0
+        base = scores[k]
+        # 마진: holdout 도메인 문장 대부분을 통과시키도록 base보다 더 관대하게.
+        #   holdout의 중앙값과 하위 경계 사이를 좀 더 낮춰 잡는다.
+        median = scores[len(scores) // 2]
+        spread = median - base
+        thr = base - spread * 0.5 - 1.0      # base보다 더 낮게(관대하게)
+        # 절대 하한/상한 클램프: 너무 빡빡(-2)하거나 너무 느슨(-13)하지 않게
+        thr = max(-12.0, min(thr, -6.0))
+        return thr
 
 
 # ======================================================================
