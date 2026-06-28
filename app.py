@@ -150,20 +150,28 @@ with tabs[1]:
                              accept_multiple_files=True, key="train_up")
     if files and st.button("자료 추가"):
         total = 0
+        infos = []
         for f in files:
             try:
                 import tempfile
                 suffix = os.path.splitext(f.name)[1]
                 with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as t:
                     t.write(f.getvalue()); tmp = t.name
-                sents = extract_corpus_from_file(tmp, f.name)
+                sents, info = extract_corpus_from_file(tmp, f.name)
+                if not sents:
+                    st.markdown(f'<div class="warn">{f.name}: {info}</div>',
+                                unsafe_allow_html=True)
+                    continue
                 added, _ = stt.add_sentences(sents, use_guardrail=False)
                 total += added
+                infos.append(f"{f.name}: {info} → 추가 {added}")
             except Exception as e:
                 st.markdown(f'<div class="warn">{f.name}: {e}</div>',
                             unsafe_allow_html=True)
         st.markdown(f'<div class="ok">{total}문장 추가 (중복 제외)</div>',
                     unsafe_allow_html=True)
+        for line in infos:
+            st.caption(line)
 
     if st.button("▶ 학습 실행", type="primary"):
         if not stt.corpus:
