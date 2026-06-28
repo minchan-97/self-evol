@@ -135,6 +135,15 @@ class EmbeddingProvider:
         self.vocab_size = self.tok_emb.shape[0]
         self.mode = "tok_emb"
 
+    def apply_matrix(self, emb_matrix, word2idx):
+        """코퍼스에서 생성한 tok_emb 행렬을 직접 적용 (자동 생성용)."""
+        self.tok_emb = np.asarray(emb_matrix, dtype=np.float64)
+        self.word2idx = {str(k): int(v) for k, v in word2idx.items()}
+        self.dim = self.tok_emb.shape[1]
+        self.vocab_size = self.tok_emb.shape[0]
+        self.mode = "tok_emb"
+        return self
+
     def _word_vec(self, w: str) -> np.ndarray:
         if self.mode == "tok_emb":
             idx = self.word2idx.get(w)
@@ -1380,3 +1389,66 @@ class SelfLoopState:
             except Exception:
                 pass
         return st
+
+
+# ======================================================================
+# 코퍼스에서 tok_emb 자동 생성 (제품용: 사용자가 tok_emb 신경 안 쓰게)
+# ======================================================================
+def build_tok_emb_from_corpus(corpus, dim=64, min_count=2, epochs=10,
+                              window=4, neg=5, lr=0.05, seed=0,
+                              max_sentences=4000):
+    """
+    코퍼스(문장 리스트)로 skip-gram tok_emb를 즉석 생성.
+    반환: (tok_emb 행렬, word2idx) 또는 (None, None) if 자료 부족.
+    자료가 적으면 품질이 낮으므로 호출측에서 분량을 확인할 것.
+    """
+    from collections import Counter
+    sents = [s for s in corpus if s and not _is_garbage_sentence(s)]
+    if len(sents) > max_sentences:
+        # 너무 많으면 샘플링(속도)
+        import random as _r
+        _r.Random(seed).shuffle(sents)
+        sents = sents[:max_sentences]
+    cnt = Counter()
+    for s in sents:
+        cnt.update(tokenize(s))
+    # 자료 적으면 min_count 완화
+    mc = min_count if len(sents) >= 200 else 1
+    vocab = [w for w, c in cnt.items() if c >= mc]
+    if len(vocab) < 10:
+        return None, None
+    w2i = {w: i for i, w in enumerate(vocab)}
+    V = len(w2i)
+    rng = np.random.default_rng(seed)
+    Win = (rng.random((V, dim)) - 0.5) / dim
+    Wout = np.zeros((V, dim))
+    freq = np.array([cnt[w] for w in vocab], float)
+    pneg = freq ** 0.75
+    pneg /= pneg.sum()
+    seqs = [[w2i[w] for w in tokenize(s) if w in w2i] for s in sents]
+    seqs = [s for s in seqs if len(s) >= 2]
+    if not seqs:
+        return None, None
+
+    def sig(x):
+        return 1.0 / (1.0 + np.exp(-np.clip(x, -30, 30)))
+
+    for ep in range(epochs):
+        rng.shuffle(seqs)
+        for s in seqs:
+            for i, ctr in enumerate(s):
+                lo, hi = max(0, i - window), min(len(s), i + window + 1)
+                for j in range(lo, hi):
+                    if j == i:
+                        continue
+                    negs = rng.choice(V, neg, p=pneg)
+                    tg = np.concatenate(([s[j]], negs))
+                    lb = np.zeros(neg + 1)
+                    lb[0] = 1.0
+                    vin = Win[ctr]
+                    vout = Wout[tg]
+                    g = sig(vout @ vin) - lb
+                    Wout[tg] -= lr * np.outer(g, vin)
+                    Win[ctr] -= lr * (g @ vout)
+    norms = np.linalg.norm(Win, axis=1, keepdims=True) + 1e-8
+    return (Win / norms).astype(np.float32), w2i
