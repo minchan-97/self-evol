@@ -85,6 +85,9 @@ with st.sidebar:
                         emb = st.session_state.emb
                 except Exception:
                     pass
+            # TF-IDF 검색 인덱스 재구축 (불러오자마자 대화 가능)
+            from selfloop_engine import CorpusSearcher
+            st.session_state.searcher = CorpusSearcher().build(stt.corpus)
             st.markdown('<div class="ok">불러왔습니다.</div>', unsafe_allow_html=True)
         except Exception as e:
             st.markdown(f'<div class="warn">불러오기 실패: {e}</div>', unsafe_allow_html=True)
@@ -135,20 +138,21 @@ with tabs[0]:
             ans = "학습된 분야 밖의 질문으로 보여 답변을 보류합니다."
             meta = f"도메인 점수 {score:.1f}"
         else:
-            # 관련 맥락 추출
-            qv = emb.encode(q)
-            sims = [-np.linalg.norm(emb.encode(s) - qv) for s in stt.corpus]
-            order = np.argsort(sims)[::-1][:5]
-            ctx = [stt.corpus[i] for i in order]
+            # 하이브리드 검색(TF-IDF + tok_emb)으로 관련 맥락 추출
+            if st.session_state.get("searcher") is None:
+                from selfloop_engine import CorpusSearcher
+                st.session_state.searcher = CorpusSearcher().build(stt.corpus)
+            hits = st.session_state.searcher.search_hybrid(q, emb=emb, topk=8)
+            ctx = [s for s, _ in hits]
             if openai_key.strip():
                 try:
                     ans = llm_answer(q, ctx, api_key=openai_key.strip())
                 except Exception as e:
                     ans = f"(LLM 호출 오류: {e})"
-                meta = "GSOM 맥락 + LLM"
+                meta = f"하이브리드 검색 {len(ctx)}문장 + LLM"
             else:
-                ans = "관련 자료:\n" + "\n".join(f"· {c}" for c in ctx)
-                meta = "GSOM 단독 (OpenAI 키 없음)"
+                ans = "관련 자료:\n" + "\n".join(f"· {c}" for c in ctx[:5])
+                meta = "검색 단독 (OpenAI 키 없음)"
         st.session_state.chat.append(("ai", ans, meta))
         st.rerun()
 
@@ -215,6 +219,9 @@ with tabs[1]:
                                         "round": stt.gsom.round})
                 if len(stt.corpus) >= 10:
                     stt.fit_guardrail(percentile=25)
+                # TF-IDF 검색 인덱스 재구축
+                from selfloop_engine import CorpusSearcher
+                st.session_state.searcher = CorpusSearcher().build(stt.corpus)
             warn = collapse_warning(stt.history)
             m = stt.history[-1]
             msg = f"학습 완료 · QE {m['mean_qe']:.2f} · 노드 {stt.gsom.n} · 임베딩 {emb.mode}"
