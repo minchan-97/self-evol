@@ -167,7 +167,7 @@ st.markdown("# SelfLoop SOM")
 st.markdown("<span class='mono' style='color:#8b949e'>자율 성장 의미지도 · 학습 루프와 답변 루프</span>",
             unsafe_allow_html=True)
 
-page = st.tabs(["◐  학습 루프", "◑  답변 루프"])
+page = st.tabs(["◐  학습 루프", "◑  답변 루프", "⚡ 정밀 학습", "♾️ 연속 자동학습"])
 
 # ======================================================================
 # PAGE 1 — 학습 루프
@@ -607,3 +607,105 @@ with page[1]:
 
         st.divider()
         st.caption("팁: 답변 저장을 켜면 Q·A가 코퍼스에 누적됩니다. 이후 학습 루프를 다시 돌리면 SOM 지도와 도메인 경계에 반영됩니다.")
+
+
+# ======================================================================
+# PAGE 3 — 정밀 학습 (부분 역양자화 + 소프트맥스 + 국소 미세조정)
+# ======================================================================
+with page[2]:
+    stt = st.session_state.state
+    emb = st.session_state.emb
+    st.markdown("### ⚡ 정밀 학습 (관심 영역 집중)")
+    st.caption("관심 있는 주제(여러 문장)만 골라, SOM의 그 영역만 역양자화해서 "
+               "소프트맥스로 부드럽게 미세조정합니다. 전체 재학습 없이 관심사만 또렷해집니다. "
+               "※ 한 문장만 넣으면 과적합됩니다 — 관련 문장 여러 개(영역)를 넣으세요.")
+
+    if not stt.corpus or stt.gsom.W.size == 0:
+        st.markdown('<div class="warn">먼저 학습 루프에서 코퍼스를 학습하세요.</div>',
+                    unsafe_allow_html=True)
+    else:
+        region_text = st.text_area(
+            "관심 영역 문장들 (줄바꿈으로 구분, 2개 이상 권장)",
+            height=120, placeholder="예)\n뜀틀 도약 기술\n매트 구르기 동작\n평균대 균형 잡기")
+        c1, c2 = st.columns(2)
+        passes = c1.slider("미세조정 반복", 1, 15, 8)
+        do_forget = c2.checkbox("망각 적용 (안 쓴 영역 흐리기)", value=False)
+
+        if st.button("⚡ 정밀 학습 실행", type="primary"):
+            from soft_refine import SoftRefiner
+            from selfloop_engine import Quantizer
+            lines = [s.strip() for s in region_text.split("\n") if s.strip()]
+            if len(lines) < 1:
+                st.markdown('<div class="warn">관심 문장을 입력하세요.</div>',
+                            unsafe_allow_html=True)
+            else:
+                if len(lines) == 1:
+                    st.markdown('<div class="warn">한 문장만 넣으면 과적합될 수 있습니다. '
+                                '관련 문장을 여러 개 넣는 것을 권장합니다.</div>',
+                                unsafe_allow_html=True)
+                qz = Quantizer(stt.gsom.W)
+                Wq = qz.q(stt.gsom.W)
+                ref = SoftRefiner(Wq, qz.scale, temp=2.0, lr=0.3)
+                region_vecs = [emb.encode(s) for s in lines]
+                qe_before = float(np.mean([ref.local_qe(v) for v in region_vecs]))
+                params = ref.refine_region(region_vecs, passes=passes)
+                qe_after = float(np.mean([ref.local_qe(v) for v in region_vecs]))
+                forget_info = ref.forget() if do_forget else None
+                # 미세조정 결과를 SOM에 반영 (역양자화해서 W 갱신)
+                stt.gsom.W = ref.W_q.astype(np.float64) * qz.scale
+                msg = (f"정밀 학습 완료 · 영역 QE {qe_before:.3f} → {qe_after:.3f} "
+                       f"({(qe_before-qe_after)/max(qe_before,1e-6)*100:+.1f}%) · "
+                       f"자동 파라미터: temp={params['temp']}, lr={params['lr']}, k={params['k']}")
+                st.markdown(f'<div class="ok">{msg}</div>', unsafe_allow_html=True)
+                if forget_info:
+                    st.caption(f"망각: {forget_info['forgotten']}개 노드 흐림 처리, "
+                               f"{forget_info['kept_sharp']}개 또렷 유지")
+
+
+# ======================================================================
+# PAGE 4 — 연속 자동학습 (스스로 검색하며 다양한 분야 학습)
+# ======================================================================
+with page[3]:
+    stt = st.session_state.state
+    emb = st.session_state.emb
+    st.markdown("### ♾️ 연속 자동학습")
+    st.caption("대화/씨앗 주제에서 출발해, 스스로 검색어를 만들고 Brave로 검색·수집·학습을 "
+               "반복합니다. 보상이 높았던 방향은 강화하고 가끔 새 분야로 탐색합니다. "
+               "한 사이클씩 돌며 결과를 보여줍니다.")
+
+    if len(stt.corpus) < 5:
+        st.markdown('<div class="warn">먼저 어느 정도(5문장 이상) 학습된 코퍼스가 필요합니다.</div>',
+                    unsafe_allow_html=True)
+    else:
+        a1, a2, a3 = st.columns(3)
+        al_brave = a1.text_input("Brave API Key", type="password",
+                                 value=os.environ.get("BRAVE_API_KEY", ""),
+                                 key="al_brave")
+        n_cycles = a2.slider("실행할 사이클 수", 1, 10, 3)
+        al_pages = a3.slider("사이클당 페이지", 1, 5, 3)
+        seed = st.text_input("씨앗 주제 (비우면 SOM이 스스로 방향 선택)",
+                             placeholder="예) 특수교육 개별화 / 비우면 자동")
+
+        if st.button("♾️ 연속 자동학습 시작", type="primary"):
+            from auto_learn import AutoLearner
+            learner = AutoLearner(stt, emb,
+                                  brave_api_key=al_brave.strip() or None,
+                                  max_pages=al_pages, train_rounds=3)
+            prog = st.progress(0.0)
+            box = st.container()
+            for i in range(n_cycles):
+                rec = learner.step(seed_text=seed.strip() or None)
+                prog.progress((i + 1) / n_cycles)
+                tag = "✅" if (rec.get("reward") or 0) > 0 else "⚠️"
+                with box:
+                    rw = rec.get("reward")
+                    st.markdown(
+                        f"<div class='{'ok' if (rw or 0)>0 else 'warn'}'>"
+                        f"{tag} <b>사이클 {rec['cycle']}</b> · 검색어: <b>{rec['query']}</b> "
+                        f"({rec['mode']}) · 추가 {rec['added']}/거부 {rec['rejected']} · "
+                        f"보상 {rw if rw is not None else '-'} · {rec['note']}</div>",
+                        unsafe_allow_html=True)
+            st.success(f"{n_cycles}사이클 완료 · 현재 코퍼스 {len(stt.corpus)}문장 · "
+                       f"노드 {stt.gsom.n}")
+            st.caption("보상이 높았던 검색어 방향이 다음 실행에서 우선됩니다. "
+                       "여러 번 돌릴수록 잘 배워지는 분야로 수렴하고, 가끔 새 분야로 넓힙니다.")
