@@ -1246,7 +1246,7 @@ def llm_answer(
     context_sentences,
     model="gpt-4o-mini",
     temperature=0.3,
-    max_tokens=400,
+    max_tokens=1000,
     api_key: str | None = None,
     base_url: str | None = None,
     system_prompt: str | None = None,
@@ -1275,11 +1275,15 @@ def llm_answer(
     ctx = "\n".join(f"- {s}" for s in context_sentences[:15])
     user = f"[학습된 맥락]\n{ctx}\n\n[질문]\n{question}"
 
-    # 시스템 프롬프트 미사용: 맥락만 user 메시지로 전달.
-    # system_prompt를 명시적으로 넘긴 경우에만 system 메시지를 추가한다.
-    messages = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
+    default_system = (
+        "당신은 주어진 문서 맥락에 근거해 답하는 전문 어시스턴트입니다.\n"
+        "규칙:\n"
+        "1. 아래 맥락을 최우선 근거로 사용하세요.\n"
+        "2. 맥락에 있는 구체적 내용(수치, 용어, 절차)을 활용해 상세히 답하세요.\n"
+        "3. 맥락에 없는 내용은 일반 지식으로 보완하되, 맥락과 모순되면 안 됩니다.\n"
+        "4. 한국어로, 충분히 구체적이고 친절하게 답하세요."
+    )
+    messages = [{"role": "system", "content": system_prompt or default_system}]
     messages.append({"role": "user", "content": user})
 
     try:
@@ -1452,3 +1456,144 @@ def build_tok_emb_from_corpus(corpus, dim=64, min_count=2, epochs=10,
                     Win[ctr] -= lr * (g @ vout)
     norms = np.linalg.norm(Win, axis=1, keepdims=True) + 1e-8
     return (Win / norms).astype(np.float32), w2i
+
+
+# ======================================================================
+# TF-IDF 검색 엔진 (옛 GasCore 에서 이식 — 문서 기반 정확한 맥락 추출)
+# tok_emb 유사도가 부정확할 때도, 단어 겹침으로 관련 문장을 확실히 찾음.
+# ======================================================================
+# 검색 전용 조사/어미 분리 (핵심어 매칭률 향상: '청구항이'→'청구항')
+_SEARCH_JOSA = ["으로부터", "에서부터", "에게서", "으로서", "이라고", "으로는",
+                "에서는", "에게는", "에서", "에게", "한테", "으로", "이랑",
+                "부터", "까지", "마다", "보다", "처럼", "만큼", "이나",
+                "에도", "에만", "에는", "이라", "이고", "이가", "이를", "이는",
+                "와", "과", "랑", "로", "을", "를", "은", "는", "이", "가",
+                "의", "도", "만", "에"]
+
+def _search_tokenize(sentence: str):
+    """검색 전용: 기본 토큰화 후 조사를 한 번 더 떼어 핵심어 매칭률을 높인다."""
+    base = tokenize(sentence)
+    out = []
+    for t in base:
+        if re.fullmatch(r"[가-힣]+", t):
+            for j in sorted(_SEARCH_JOSA, key=len, reverse=True):
+                if t.endswith(j) and len(t) > len(j) + 1:
+                    t = t[:-len(j)]
+                    break
+        out.append(t)
+    return out
+
+
+class CorpusSearcher:
+    def __init__(self):
+        self.sentences = []
+        self.vocab = {}
+        self.idf = {}
+        self.vecs = None
+        self._emb_cache = None
+        self._emb_cache_n = 0
+
+    def build(self, sentences):
+        """문장 리스트로 TF-IDF 인덱스 구축."""
+        import numpy as _np
+        from collections import Counter as _C
+        sents = list(dict.fromkeys(s.strip() for s in sentences
+                                   if s and len(s.strip()) >= 6))
+        self.sentences = sents
+        if not sents:
+            self.vecs = None
+            return self
+        all_toks = []
+        for s in sents:
+            all_toks += _search_tokenize(s)
+        cnt = _C(all_toks)
+        self.vocab = {w: i for i, w in enumerate(w for w, c in cnt.most_common() if c >= 1)}
+        V = len(self.vocab)
+        N = len(sents)
+        df = _C()
+        for s in sents:
+            for t in set(_search_tokenize(s)):
+                if t in self.vocab:
+                    df[t] += 1
+        self.idf = {w: _np.log((N + 1) / (df.get(w, 0) + 1)) + 1 for w in self.vocab}
+
+        def tv(text):
+            v = _np.zeros(V)
+            toks = _search_tokenize(text)
+            ct = _C(toks)
+            for w, c in ct.items():
+                if w in self.vocab:
+                    v[self.vocab[w]] = (c / max(len(toks), 1)) * self.idf.get(w, 1.0)
+            nrm = _np.linalg.norm(v)
+            return v / nrm if nrm > 1e-12 else v
+
+        self.vecs = _np.array([tv(s) for s in sents])
+        return self
+
+    def search(self, query, topk=5):
+        """질문과 가장 유사한 문장 topk 반환: [(문장, 유사도), ...]"""
+        import numpy as _np
+        from collections import Counter as _C
+        if not self.sentences or self.vecs is None:
+            return []
+        V = len(self.vocab)
+        v = _np.zeros(V)
+        toks = _search_tokenize(query)
+        ct = _C(toks)
+        for w, c in ct.items():
+            if w in self.vocab:
+                v[self.vocab[w]] = (c / max(len(toks), 1)) * self.idf.get(w, 1.0)
+        nrm = _np.linalg.norm(v)
+        if nrm < 1e-12:
+            return []
+        v /= nrm
+        sims = self.vecs @ v
+        idx = _np.argsort(-sims)[:topk]
+        return [(self.sentences[i], float(sims[i])) for i in idx if sims[i] > 0.01]
+
+    def search_hybrid(self, query, emb=None, topk=5, w_tfidf=0.5, w_emb=0.5):
+        """
+        하이브리드 검색: TF-IDF(단어 겹침) + tok_emb(의미) 결합.
+        - TF-IDF는 드문 핵심어(특허/청구항)를 잡고
+        - tok_emb는 의미적 유사성을 잡아
+        흔한 표현('구성되어 있나')에 휘둘리는 문제를 완화한다.
+        emb 가 hash 모드면 의미 점수가 약하므로 TF-IDF 비중을 자동으로 올린다.
+        """
+        import numpy as _np
+        from collections import Counter as _C
+        if not self.sentences or self.vecs is None:
+            return []
+        # --- TF-IDF 점수 ---
+        V = len(self.vocab)
+        v = _np.zeros(V)
+        toks = _search_tokenize(query)
+        ct = _C(toks)
+        for w, c in ct.items():
+            if w in self.vocab:
+                v[self.vocab[w]] = (c / max(len(toks), 1)) * self.idf.get(w, 1.0)
+        nrm = _np.linalg.norm(v)
+        tfidf_sims = (self.vecs @ (v / nrm)) if nrm > 1e-12 else _np.zeros(len(self.sentences))
+
+        # --- tok_emb 의미 점수 ---
+        emb_sims = _np.zeros(len(self.sentences))
+        use_emb = emb is not None and getattr(emb, "mode", "hash") == "tok_emb"
+        if use_emb:
+            qv = emb.encode(query)
+            qn = qv / (_np.linalg.norm(qv) + 1e-12)
+            if self._emb_cache is None or self._emb_cache_n != len(self.sentences):
+                M = _np.array([emb.encode(s) for s in self.sentences])
+                Mn = M / (_np.linalg.norm(M, axis=1, keepdims=True) + 1e-12)
+                self._emb_cache = Mn
+                self._emb_cache_n = len(self.sentences)
+            emb_sims = self._emb_cache @ qn
+        else:
+            # 의미 점수 못 쓰면 TF-IDF에 전적으로 의존
+            w_tfidf, w_emb = 1.0, 0.0
+
+        # --- 정규화 후 결합 ---
+        def _norm01(a):
+            lo, hi = a.min(), a.max()
+            return (a - lo) / (hi - lo) if hi - lo > 1e-12 else a * 0
+        score = w_tfidf * _norm01(tfidf_sims) + w_emb * _norm01(emb_sims)
+        idx = _np.argsort(-score)[:topk]
+        return [(self.sentences[i], float(score[i])) for i in idx if score[i] > 0.01]
