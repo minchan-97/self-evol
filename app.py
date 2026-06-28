@@ -113,16 +113,40 @@ tabs = st.tabs(["💬 대화", "📚 학습"] +
 
 # ---------------- 대화 탭 (카톡 스타일) ----------------
 with tabs[0]:
-    # 대화 기록 렌더
+    # 전체 대화를 하나의 스크롤 박스로 렌더 (최신이 아래에 보이도록 자동 스크롤)
+    import html as _html
+    rows = ""
     for role, text, meta in st.session_state.chat:
         side = "me" if role == "me" else "ai"
-        st.markdown(
-            f'<div class="chat-row {side}"><div class="bubble {side}">{text}</div></div>',
-            unsafe_allow_html=True)
+        safe = _html.escape(text).replace("\n", "<br>")
+        rows += f'<div class="chat-row {side}"><div class="bubble {side}">{safe}</div></div>'
         if meta:
             align = "right" if side == "me" else "left"
-            st.markdown(f'<div class="meta" style="text-align:{align}">{meta}</div>',
-                        unsafe_allow_html=True)
+            rows += f'<div class="meta" style="text-align:{align}">{_html.escape(meta)}</div>'
+    chat_html = f"""
+<div id="chatbox" style="height:60vh;overflow-y:auto;padding:8px 4px;
+     border:1px solid #eee;border-radius:12px;background:#fafafa;">
+  {rows if rows else '<div style="color:#bbb;text-align:center;padding:2rem;">대화를 시작하세요</div>'}
+</div>
+<script>
+  var cb = document.getElementById('chatbox');
+  if (cb) {{ cb.scrollTop = cb.scrollHeight; }}
+</script>
+"""
+    import streamlit.components.v1 as components
+    components.html(
+        "<style>"
+        ".chat-row{display:flex;margin:6px 0;}"
+        ".chat-row.me{justify-content:flex-end;}"
+        ".chat-row.ai{justify-content:flex-start;}"
+        ".bubble{max-width:78%;padding:10px 14px;border-radius:16px;"
+        "font-size:15px;line-height:1.5;word-break:break-word;}"
+        ".bubble.me{background:#ededed;color:#111;border-bottom-right-radius:4px;}"
+        ".bubble.ai{background:#3897f0;color:#fff;border-bottom-left-radius:4px;}"
+        ".meta{font-size:11px;color:#999;margin:2px 6px;}"
+        "body{margin:0;font-family:'Noto Sans KR',sans-serif;}"
+        "</style>" + chat_html,
+        height=480, scrolling=False)
 
     q = st.chat_input("메시지를 입력하세요")
     if q:
@@ -146,7 +170,8 @@ with tabs[0]:
             ctx = [s for s, _ in hits]
             if openai_key.strip():
                 try:
-                    ans = llm_answer(q, ctx, api_key=openai_key.strip())
+                    ans = llm_answer(q, ctx, api_key=openai_key.strip(),
+                                     max_tokens=1500)
                 except Exception as e:
                     ans = f"(LLM 호출 오류: {e})"
                 meta = f"하이브리드 검색 {len(ctx)}문장 + LLM"
