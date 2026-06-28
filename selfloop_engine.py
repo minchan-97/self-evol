@@ -394,33 +394,30 @@ class MarkovGuardrail:
 
     def suggest_threshold(self, sentences, percentile=10, holdout=0.2):
         """
-        임계값 추천. holdout(안 외운 도메인 문장)의 점수 분포에서 경계를 잡되,
-        큰/단일도메인 코퍼스에서 과도하게 빡빡해지는 것을 막기 위해
-        '중앙값 - 넉넉한 마진' 방식 + 절대 상/하한 클램프를 쓴다.
+        임계값 추천. 핵심 원리: 도메인 안 문장은 통과시키되, 외래는 막는다.
+
+        방식: 학습된 상태에서 자기 문장들의 점수 분포를 보고,
+        그 '하위 percentile'을 경계로 삼는다(약간의 마진만).
+        holdout 을 깊게 빼면 점수가 비현실적으로 낮아져 임계값이
+        과도하게 느슨(-10 이하)해지므로, 가벼운 holdout + 분위수 기반으로 잡는다.
         """
-        import random as _rnd
-        if len(sentences) < 10:
+        import numpy as _np
+        n = len(sentences)
+        if n < 10:
             scores = sorted(self.score(s) for s in sentences)
             k = max(0, int(len(scores) * percentile / 100) - 1)
-            return min(scores[k] if scores else -9.0, -6.0)
-        sents = list(sentences)
-        _rnd.Random(0).shuffle(sents)
-        n_hold = max(10, int(len(sents) * holdout))
-        hold = sents[:n_hold]
-        train = sents[n_hold:]
-        probe = MarkovGuardrail(self.jm).fit(train)
-        scores = sorted(probe.score(s) for s in hold)
-        if not scores:
-            return -9.0
-        median = scores[len(scores) // 2]
-        low = scores[max(0, int(len(scores) * 0.1) - 1)]  # 하위 10%
-        # 도메인 안 문장 대부분(중앙값 부근)을 통과시키도록,
-        # 중앙값에서 (중앙값-하위10%) 만큼 더 내려 넉넉히 잡는다.
-        spread = max(0.5, median - low)
-        thr = low - spread * 1.0
-        # 절대 클램프: 너무 빡빡(-1~-5)하거나 너무 느슨(-13)하지 않게
-        thr = max(-12.0, min(thr, -6.0))
-        return thr
+            return float(min(scores[k] if scores else -9.0, -6.0))
+
+        # 자기 문장 점수 분포 (현재 학습 상태 기준)
+        self_scores = _np.array(sorted(self.score(s) for s in sentences))
+        # 하위 percentile 지점 — 도메인 안 문장 중 가장 낮은 축
+        p_low = float(_np.percentile(self_scores, percentile))
+        # 약간의 마진(분포 폭의 일부)만 더 내려 경계를 잡는다
+        spread = float(self_scores.std())
+        thr = p_low - 0.5 * spread
+        # 절대 클램프: 정체성 방어가 작동하는 범위로 (-9 ~ -5)
+        thr = max(-9.0, min(thr, -5.0))
+        return float(thr)
 
 
 # ======================================================================
@@ -794,6 +791,23 @@ def _is_garbage_sentence(s: str) -> bool:
         upper = len(re.findall(r"[A-Z]", s))
         if upper / max(1, len(s)) > 0.2:
             return True
+    # --- 웹/위키 잡음 (자율 탐색 오염원) ---
+    # 위키 각주/참조: "^ Serugendo...", "Archived from the original", "[ 17 ]", "[ 편집 ]"
+    if re.match(r"^\s*\^", s) or "Archived from the original" in s:
+        return True
+    if re.search(r"\[\s*편집\s*\]|\[\s*\d+\s*\]", s):
+        return True
+    # 웹 UI 잡음: 메뉴/네비게이션/입력창
+    web_ui = ("바로가기", "메뉴", "로그인", "회원가입", "글자수", "검색어",
+              "이용약관", "개인정보처리방침", "저작권", "사이트맵", "댓글")
+    hit = sum(1 for k in web_ui if k in s)
+    if hit >= 2:
+        return True
+    if re.search(r"\(\s*0\s*/\s*\d+\s*\)", s):  # (0 / 10000) 같은 입력창
+        return True
+    # 코드 파편: "print ( ", "df ." 등
+    if re.search(r"\bprint\s*\(|\bdf\s*\.|import\s+\w+", s) and not has_ko:
+        return True
     return False
 
 
