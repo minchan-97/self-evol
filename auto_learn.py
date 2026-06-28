@@ -23,6 +23,27 @@ from selfloop_engine import (autonomous_queries, crawl_topic, measure,
                              learning_reward, tokenize)
 
 
+# 자율 탐색에서 무관 분야로 새게 만드는 '너무 일반적인' 검색어들.
+# 이런 단어로 검색하면 세상 모든 분야가 딸려와 정체성이 오염된다.
+_TOO_GENERIC = {
+    "실험", "관점", "방법", "결과", "내용", "경우", "문제", "사용", "활용",
+    "분석", "처리", "기반", "통해", "대한", "위한", "이런", "그런", "여러",
+    "다양", "관련", "정보", "자료", "시스템", "연구", "설계", "구조", "방식",
+    "self", "organizing", "outlier", "smoothing", "data", "the", "and",
+}
+
+
+def _is_too_generic(query: str) -> bool:
+    """검색어가 너무 일반적이면(무관 분야 유입 위험) True."""
+    toks = [t for t in tokenize(query) if len(t) >= 2]
+    if not toks:
+        return True
+    generic_hits = sum(1 for t in toks if t.lower() in _TOO_GENERIC)
+    # 절반 이상이 일반어이거나, 단어가 1개뿐인데 일반어면 위험
+    return generic_hits >= max(1, len(toks) // 2 + 1) or \
+        (len(toks) == 1 and toks[0].lower() in _TOO_GENERIC)
+
+
 def seed_topics_from_text(text: str, max_topics=3):
     """대화/질문 텍스트에서 명사 위주 씨앗 검색어 추출(조사·짧은 토큰 제거)."""
     toks = [t for t in tokenize(text) if len(t) >= 2]
@@ -65,6 +86,9 @@ class AutoLearner:
         except Exception:
             pass
         cands = [c for c in cands if c and c.strip()]
+        # 너무 일반적인 검색어 제거 (무관 분야 유입 차단)
+        filtered = [c for c in cands if not _is_too_generic(c)]
+        cands = filtered or cands  # 다 걸러지면 원본 유지(빈 검색 방지)
         if not cands:
             return None, "none"
         # 정책으로 정렬(explore/exploit)
