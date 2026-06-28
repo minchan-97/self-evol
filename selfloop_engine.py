@@ -386,7 +386,8 @@ class MarkovGuardrail:
     def suggest_threshold(self, sentences, percentile=10, holdout=0.2):
         """
         임계값 추천. holdout(안 외운 도메인 문장)의 점수 분포에서 경계를 잡되,
-        큰 코퍼스에서 과하게 빡빡해지지 않도록 마진과 절대 하한을 둔다.
+        큰/단일도메인 코퍼스에서 과도하게 빡빡해지는 것을 막기 위해
+        '중앙값 - 넉넉한 마진' 방식 + 절대 상/하한 클램프를 쓴다.
         """
         import random as _rnd
         if len(sentences) < 10:
@@ -402,15 +403,13 @@ class MarkovGuardrail:
         scores = sorted(probe.score(s) for s in hold)
         if not scores:
             return -9.0
-        # 하위 percentile 위치
-        k = max(0, int(len(scores) * percentile / 100) - 1)
-        base = scores[k]
-        # 마진: holdout 도메인 문장 대부분을 통과시키도록 base보다 더 관대하게.
-        #   holdout의 중앙값과 하위 경계 사이를 좀 더 낮춰 잡는다.
         median = scores[len(scores) // 2]
-        spread = median - base
-        thr = base - spread * 0.5 - 1.0      # base보다 더 낮게(관대하게)
-        # 절대 하한/상한 클램프: 너무 빡빡(-2)하거나 너무 느슨(-13)하지 않게
+        low = scores[max(0, int(len(scores) * 0.1) - 1)]  # 하위 10%
+        # 도메인 안 문장 대부분(중앙값 부근)을 통과시키도록,
+        # 중앙값에서 (중앙값-하위10%) 만큼 더 내려 넉넉히 잡는다.
+        spread = max(0.5, median - low)
+        thr = low - spread * 1.0
+        # 절대 클램프: 너무 빡빡(-1~-5)하거나 너무 느슨(-13)하지 않게
         thr = max(-12.0, min(thr, -6.0))
         return thr
 
@@ -733,6 +732,16 @@ def collapse_warning(history, window=3):
         return "붕괴 경보: 점유율·어휘·QE 동반 감소 (자기출력 메아리방)"
     if down("occupancy") and rec[-1]["occ_ratio"] < 0.1:
         return "붕괴 경보: 점유율 10%↓ 한 점 수렴"
+    # 어휘 다양성 급락(메아리/중복 폭증) — 더 넓은 창으로도 감지
+    if len(history) >= 6:
+        vd = [h["vocab_div"] for h in history]
+        recent_max = max(vd[-6:])
+        if vd[-1] < 0.12 and recent_max > 0.25:
+            return ("붕괴 경보: 어휘 다양성 급락(중복·메아리 의심) — "
+                    "수집 중복 제거를 확인하세요")
+    # 점유율 만성 저하 + 노드 과성장
+    if rec[-1]["occ_ratio"] < 0.15 and rec[-1]["nodes"] > 200:
+        return "붕괴 경보: 점유율 15%↓ + 노드 과성장 (빈 격자 누적)"
     return None
 
 
@@ -1302,8 +1311,22 @@ class SelfLoopState:
     def add_sentences(self, sentences, use_guardrail=True):
         """
         코퍼스에 문장 추가. use_guardrail=True면 가드레일 통과분만 저장.
+        중복(이미 코퍼스에 있는 문장)은 자동 제거 → '학습 메아리 붕괴' 방지.
         반환: (추가된 수, 거부된 수)
         """
+        # --- 중복 제거: 기존 코퍼스 + 이번 입력 내부 중복 모두 ---
+        existing = set(self.corpus)
+        deduped = []
+        seen = set()
+        for s in sentences:
+            if s in existing or s in seen:
+                continue
+            seen.add(s)
+            deduped.append(s)
+        sentences = deduped
+        if not sentences:
+            return 0, 0
+
         if not use_guardrail or not self.guardrail.trained:
             self.corpus += sentences
             return len(sentences), 0
