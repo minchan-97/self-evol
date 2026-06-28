@@ -128,8 +128,24 @@ class AutoLearner:
             self.history.append(rec)
             return rec
 
-        # 가드레일 필터 + 추가
-        added, rejected = self.state.add_sentences(sents, use_guardrail=self.use_guardrail)
+        # 가드레일 필터 + 탐지 기반 학습 가이드로 추가
+        # 1차: 가드레일(도메인 밖 차단) → 2차: 학습가이드(아는것 skip, 새것 우선)
+        try:
+            from learning_guide import LearningGuide
+            lg = LearningGuide(self.state, self.emb)
+            batch = lg.guide_batch(sents)
+            learn_sents = [s for s, _ in batch["learn"]]
+            rec["skipped"] = batch["summary"]["skip"]
+            rec["guide_rejected"] = batch["summary"]["reject"]
+            if learn_sents:
+                added, rejected = self.state.add_sentences(
+                    learn_sents, use_guardrail=self.use_guardrail)
+            else:
+                added, rejected = 0, len(sents)
+        except Exception:
+            # 가이드 실패 시 기존 방식 폴백
+            added, rejected = self.state.add_sentences(
+                sents, use_guardrail=self.use_guardrail)
         rec["added"], rec["rejected"] = added, rejected
         if added == 0:
             rec["note"] = "전부 도메인 밖 거부"
