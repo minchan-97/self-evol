@@ -76,6 +76,15 @@ with st.sidebar:
                 f.write(up.getvalue()); tmp = f.name
             st.session_state.state = SelfLoopState.load(tmp)
             stt = st.session_state.state
+            # 불러온 코퍼스로 tok_emb 자동 재생성 (의미 임베딩 복원)
+            if len(stt.corpus) >= 50:
+                try:
+                    mat, w2i = build_tok_emb_from_corpus(stt.corpus, dim=DIM, epochs=8)
+                    if mat is not None:
+                        st.session_state.emb.apply_matrix(mat, w2i)
+                        emb = st.session_state.emb
+                except Exception:
+                    pass
             st.markdown('<div class="ok">불러왔습니다.</div>', unsafe_allow_html=True)
         except Exception as e:
             st.markdown(f'<div class="warn">불러오기 실패: {e}</div>', unsafe_allow_html=True)
