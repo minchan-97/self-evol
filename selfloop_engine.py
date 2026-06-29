@@ -1323,16 +1323,49 @@ class SelfLoopState:
         self.history: list[dict] = []     # 라운드별 계측
         self.guardrail = MarkovGuardrail() # 도메인 마르코프 가드레일
         self.guard_threshold = -9.5        # 거부 임계값
+        # --- 정체성 기준선 가드레일 (한 번 박으면 고정, 오염 안 됨) ---
+        self.baseline_guardrail = None     # 깨끗한 seed로 만든 고정 문지기
+        self.baseline_threshold = -9.5
+        self.baseline_locked = False       # True면 재학습해도 안 바뀜
         self.rejected_log: list = []       # 거부된 문장 기록(검토용)
         self.policy = QueryPolicy(epsilon=0.3)  # 보상 기반 검색어 정책
         self.created = time.time()
 
+    def lock_identity_baseline(self, percentile=25):
+        """
+        현재 코퍼스(깨끗할 때 호출)로 정체성 기준선 가드레일을 만들고 잠근다.
+        이후 코퍼스가 오염돼도 이 기준선은 안 변해 '자기 자신'을 지킨다.
+        """
+        if len(self.corpus) < 10:
+            return False
+        self.baseline_guardrail = MarkovGuardrail().fit(list(self.corpus))
+        self.baseline_threshold = self.baseline_guardrail.suggest_threshold(
+            self.corpus, percentile=percentile)
+        self.baseline_locked = True
+        return True
+
+    def check_identity(self, sentence):
+        """
+        정체성 기준선으로 판정 (오염되지 않은 원래 자기 기준).
+        기준선이 없으면 현재 가드레일로 폴백.
+        반환: (통과여부, 점수)
+        """
+        if self.baseline_locked and self.baseline_guardrail is not None:
+            return self.baseline_guardrail.judge(sentence, self.baseline_threshold)
+        if self.guardrail and self.guardrail.trained:
+            return self.guardrail.judge(sentence, self.guard_threshold)
+        return True, 0.0
+
     def fit_guardrail(self, percentile=15):
-        """현재 코퍼스로 가드레일 학습 + 임계값 자동 추천."""
+        """현재 코퍼스로 가드레일 학습 + 임계값 자동 추천.
+        단, 정체성 기준선이 잠겨 있으면 그것은 건드리지 않는다."""
         if len(self.corpus) >= 10:
             self.guardrail.fit(self.corpus)
             self.guard_threshold = self.guardrail.suggest_threshold(
                 self.corpus, percentile=percentile)
+            # 기준선이 아직 없으면, 첫 학습 시점(가장 깨끗)을 기준선으로 자동 고정
+            if not self.baseline_locked:
+                self.lock_identity_baseline(percentile=max(percentile, 25))
         return self.guard_threshold
 
     def add_sentences(self, sentences, use_guardrail=True):
@@ -1380,6 +1413,17 @@ class SelfLoopState:
             "policy_count": self.policy.kw_count,
             "policy_log": self.policy.log[-300:],
         }
+        # 정체성 기준선 가드레일 저장 (오염 안 되는 고정 문지기)
+        if self.baseline_locked and self.baseline_guardrail is not None:
+            bg = self.baseline_guardrail
+            blob["baseline"] = {
+                "uni": dict(bg.uni),
+                "bi": dict(bg.bi),
+                "uni_total": bg.uni_total,
+                "vocab": list(bg.vocab),
+                "jm": bg.jm,
+                "threshold": self.baseline_threshold,
+            }
         with open(path, "wb") as f:
             pickle.dump(blob, f)
 
@@ -1404,6 +1448,21 @@ class SelfLoopState:
         if len(st.corpus) >= 10:
             try:
                 st.fit_guardrail()
+            except Exception:
+                pass
+        # 정체성 기준선 복원 (저장돼 있으면 — 오염 안 된 원래 기준)
+        if "baseline" in b:
+            try:
+                bl = b["baseline"]
+                bg = MarkovGuardrail(bl.get("jm", 0.7))
+                bg.uni = bl["uni"]
+                bg.bi = bl["bi"]
+                bg.uni_total = bl["uni_total"]
+                bg.vocab = set(bl["vocab"])
+                bg.trained = len(bg.vocab) > 1
+                st.baseline_guardrail = bg
+                st.baseline_threshold = bl["threshold"]
+                st.baseline_locked = True
             except Exception:
                 pass
         return st
