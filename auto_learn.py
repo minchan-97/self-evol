@@ -129,7 +129,16 @@ class AutoLearner:
             return rec
 
         # 가드레일 필터 + 탐지 기반 학습 가이드로 추가
-        # 1차: 가드레일(도메인 밖 차단) → 2차: 학습가이드(아는것 skip, 새것 우선)
+        # 0차: 정체성 기준선(오염 안 된 원래 기준)으로 외래 선차단
+        # 1차: 가드레일 → 2차: 학습가이드(아는것 skip, 새것 우선)
+        if getattr(self.state, "baseline_locked", False):
+            sents = [s for s in sents if self.state.check_identity(s)[0]]
+            if not sents:
+                rec["note"] = "정체성 기준선이 전부 외래로 차단"
+                if hasattr(self.state, "policy"):
+                    self.state.policy.record(q, -0.2)
+                self.history.append(rec)
+                return rec
         try:
             from learning_guide import LearningGuide
             lg = LearningGuide(self.state, self.emb)
@@ -143,7 +152,6 @@ class AutoLearner:
             else:
                 added, rejected = 0, len(sents)
         except Exception:
-            # 가이드 실패 시 기존 방식 폴백
             added, rejected = self.state.add_sentences(
                 sents, use_guardrail=self.use_guardrail)
         rec["added"], rec["rejected"] = added, rejected
